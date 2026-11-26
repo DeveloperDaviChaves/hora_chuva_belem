@@ -71,6 +71,24 @@ def localizar_precipitacao(df: pd.DataFrame) -> str:
         "e ajuste PRECIPITATION_COLUMN_HINT em src/config.py."
     )
 
+def converter_data_hora(data: pd.Series, hora: pd.Series) -> pd.Series:
+    """Converte data e hora sem inverter dia e mês.
+
+    O INMET usa AAAA-MM-DD (ou AAAA/MM/DD) nos arquivos mais novos e DD/MM/AAAA
+    nos mais antigos. Com dayfirst=True, datas AAAA-MM-DD têm dia e mês trocados
+    e as datas com dia maior que 12 viram erro (e são descartadas).
+    """
+    data = data.str.replace("/", "-", regex=False)
+    validas = data.dropna()
+    primeira = validas.iloc[0] if len(validas) else ""
+    formato_data = "%Y-%m-%d" if re.match(r"^\d{4}-", primeira) else "%d-%m-%Y"
+    hora = hora.str.slice(0, 5)
+    return pd.to_datetime(
+        data + " " + hora,
+        format=f"{formato_data} %H:%M",
+        errors="coerce",
+    )
+
 def preparar_arquivo(caminho: Path) -> pd.DataFrame:
     df = ler_csv_inmet(caminho)
     df.columns = [str(c).strip() for c in df.columns]
@@ -90,11 +108,13 @@ def preparar_arquivo(caminho: Path) -> pd.DataFrame:
     hora = hora.str.replace(r"^(\d{2})(\d{2})$", r"\1:\2", regex=True)
     hora = hora.str.slice(0, 8)
 
-    timestamp = pd.to_datetime(
-        data + " " + hora,
-        errors="coerce",
-        dayfirst=True
-    )
+    timestamp = converter_data_hora(data, hora)
+    sem_data = timestamp.isna().mean()
+    if sem_data > 0.01:
+        raise ValueError(
+            f"{sem_data:.1%} das datas não puderam ser lidas. "
+            "Confira o formato da coluna de data."
+        )
 
     precipitacao = pd.to_numeric(
         df[col_precip].replace(MISSING_VALUES, pd.NA),
@@ -156,6 +176,18 @@ def construir_silver() -> pd.DataFrame:
         subset=["data_hora_utc", "precipitacao_mm"],
         keep="first"
     )
+
+    # Verificações de sanidade: datas no futuro e cobertura por ano.
+    agora = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
+    futuras = int((silver["data_hora_local"] > agora).sum())
+    if futuras:
+        print(f"ALERTA: {futuras} registros com data no futuro. Confira o formato das datas.")
+    cobertura = silver.groupby("ano")["precipitacao_mm"].count()
+    print("Registros válidos por ano (um ano completo tem cerca de 8.760):")
+    print(cobertura.to_string())
+    baixos = [int(a) for a, n in cobertura.items() if n < 4380 and a < agora.year]
+    if baixos:
+        print(f"ALERTA: anos com menos de 50% de cobertura: {baixos}")
 
     SILVER_FILE.parent.mkdir(parents=True, exist_ok=True)
     silver.to_csv(SILVER_FILE, index=False, encoding="utf-8")
